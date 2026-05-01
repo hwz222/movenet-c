@@ -24,5 +24,23 @@ void   tensor_fill(MyTensor *t, int8_t val);
 void   tensor_print(const MyTensor *t);
 
 void tensor_quantize(MyTensor *t, float scale, int8_t zero_point);
+void tensor_quantize_u8(MyTensor *t, const uint8_t *src);
 void tensor_add_scalar(MyTensor *t, int8_t scalar);
+
+/* Decompose a float multiplier M into a 15-bit fixed-point integer and a
+   right-shift count so that  M * x  ≈  (mult * x) >> shift  (rounded).
+   Computed in software (double precision) so mult fits in int16 for
+   hardware 16x16 multiply. */
+void quantize_multiplier(float M, int16_t *mult, int *shift);
+
+/* Element-wise quantized add:
+   out[i] = clamp( M1*(a[i]-zp_a) + M2*(b[i]-zp_b) + zp_out, -128, 127 )
+   where M1 = scale_a/scale_out,  M2 = scale_b/scale_out.
+   All arithmetic is done in fixed-point (no float per element). */
+void tensor_add_q(MyTensor       *out,
+                  const MyTensor *a,
+                  const MyTensor *b,
+                  float scale_out,   int8_t zp_out,
+                  float scale_a,     int8_t zp_a,
+                  float scale_b,     int8_t zp_b);
 #endif
