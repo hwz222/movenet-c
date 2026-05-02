@@ -93,6 +93,64 @@ void tensor_print(const MyTensor *t)
     }
 }
 
+/* ================================================================
+ *  Conv2D helpers
+ * ================================================================ */
+
+/* Apply a 15-bit fixed-point multiplier to a 32-bit accumulator using
+ * two 16x16 hardware multiplications.
+ * Computes round( mult * acc * 2^(-shift) ).
+ *
+ * acc is split into hi (upper 16 bits) and lo (lower 16 bits).
+ * Each part is multiplied by mult (16x16 → int32), then recombined.
+ * A sign correction is applied because acc_lo is signed int16 but
+ * represents unsigned 16-bit data (upper bit is magnitude, not sign). */
+static int32_t apply_mult_q(int16_t mult, int shift, int32_t acc)
+{
+    int16_t acc_hi = (int16_t)(acc >> 16);
+    int16_t acc_lo = (int16_t)(acc & 0xFFFF);
+
+    int32_t prod_hi = (int32_t)mult * (int32_t)acc_hi;  /* 16x16 → 32 */
+    int32_t prod_lo = (int32_t)mult * (int32_t)acc_lo;  /* 16x16 → 32 */
+
+    int64_t r = ((int64_t)prod_hi << 16) + (int64_t)prod_lo;
+    if (acc_lo < 0) r += (int64_t)mult << 16;  /* correct unsigned lower bits */
+
+    if (shift > 0) { r += 1LL << (shift - 1); r >>= shift; }
+    else if (shift < 0) { r <<= (-shift); }
+    return (int32_t)r;
+}
+
+/* Accumulate the dot product for one output pixel (oh, ow) and one filter.
+ * Σ_{r,s,c} (input[ih, iw, c] - zp_in) * filter[r, s, c]
+ * Out-of-bounds input pixels (padding region) contribute 0. */
+static int32_t conv2d_accum(
+    const MyTensor *input,
+    const MyTensor *filter,
+    int32_t oh,       int32_t ow,
+    int32_t stride_h, int32_t stride_w,
+    int32_t dil_h,    int32_t dil_w,
+    int32_t pad_h,    int32_t pad_w,
+    int8_t  zp_in)
+{
+    int32_t acc = 0;
+    for (int32_t fh = 0; fh < filter->h; fh++) {
+        int32_t ih = oh * stride_h + fh * dil_h - pad_h;
+        if (ih < 0 || ih >= input->h) continue;
+        for (int32_t fw = 0; fw < filter->w; fw++) {
+            int32_t iw = ow * stride_w + fw * dil_w - pad_w;
+            if (iw < 0 || iw >= input->w) continue;
+            const int8_t *x = &input->data[(ih * input->w + iw) * input->c];
+            const int8_t *w = &filter->data[(fh * filter->w + fw) * filter->c];
+            for (int32_t c = 0; c < filter->c; c++)
+                acc += ((int32_t)x[c] - (int32_t)zp_in) * (int32_t)w[c];
+        }
+    }
+    return acc;
+}
+
+/* ================================================================ */
+
 void quantize_multiplier(float M, int16_t *mult, int *shift)
 {
     if (M == 0.0f) { *mult = 0; *shift = 0; return; }
@@ -154,4 +212,94 @@ void tensor_add_q(MyTensor       *out,
         else if (r < -128) r = -128;
         out->data[i] = (int8_t)r;
     }
+}
+
+MyTensor *tensor3d_conv3d_q(
+    const MyTensor  *input,
+    const MyTensor  *filters,
+    int32_t          n_filters,
+    const int8_t    *bias,
+    int32_t          padding,
+    int32_t          dilation_h,
+    int32_t          dilation_w,
+    int32_t          stride_h,
+    int32_t          stride_w,
+    int              relu6,
+    double           scale_input,
+    double           scale_output,
+    const double    *scale_filter,
+    double           scale_bias,
+    int8_t           zp_input,
+    int8_t           zp_output,
+    int8_t           zp_bias)
+{
+    int32_t fh     = filters[0].h;
+    int32_t fw     = filters[0].w;
+    int32_t out_h  = (input->h + 2*padding - dilation_h*(fh-1) - 1) / stride_h + 1;
+    int32_t out_w  = (input->w + 2*padding - dilation_w*(fw-1) - 1) / stride_w + 1;
+
+    MyTensor *out = tensor_create(out_h, out_w, n_filters);
+    if (!out) return NULL;
+
+    /* Activation clamp bounds (int8 space) */
+    int32_t act_min = -128;
+    int32_t act_max =  127;
+    if (relu6) {
+        act_min = (int32_t)zp_output;
+        act_max = (int32_t)zp_output + (int32_t)llround(6.0 / scale_output);
+        if (act_min < -128) act_min = -128;
+        if (act_max >  127) act_max =  127;
+    }
+
+    /* Per-channel setup (software, runs once per channel) ──────────────
+     * M^(k) = scale_input * scale_filter[k] / scale_output
+     * bias_q^(k) = round( scale_bias / (scale_input * scale_filter[k])
+     *                     * (bias[k] - zp_bias) )
+     * ----------------------------------------------------------------- */
+    int16_t *mult   = (int16_t *)malloc((size_t)n_filters * sizeof(int16_t));
+    int     *shift  = (int     *)malloc((size_t)n_filters * sizeof(int));
+    int32_t *bias_q = (int32_t *)malloc((size_t)n_filters * sizeof(int32_t));
+    if (!mult || !shift || !bias_q) {
+        free(mult); free(shift); free(bias_q);
+        tensor_free(out); return NULL;
+    }
+
+    for (int32_t k = 0; k < n_filters; k++) {
+        double M = scale_input * scale_filter[k] / scale_output;
+        quantize_multiplier((float)M, &mult[k], &shift[k]);
+        double bias_ratio = scale_bias / (scale_input * scale_filter[k]);
+        bias_q[k] = (int32_t)llround(bias_ratio * (double)(bias[k] - zp_bias));
+    }
+
+    /* Main loops ──────────────────────────────────────────────────────── */
+    for (int32_t oh = 0; oh < out_h; oh++) {
+        for (int32_t ow = 0; ow < out_w; ow++) {
+            for (int32_t k = 0; k < n_filters; k++) {
+
+                /* Integer accumulation — no multiply hardware needed */
+                int32_t acc = conv2d_accum(
+                    input, &filters[k],
+                    oh, ow,
+                    stride_h, stride_w,
+                    dilation_h, dilation_w,
+                    padding, padding,
+                    zp_input);
+
+                /* Add pre-scaled bias */
+                acc += bias_q[k];
+
+                /* Scale to output domain: two 16x16 multiplications */
+                int32_t r = apply_mult_q(mult[k], shift[k], acc)
+                          + (int32_t)zp_output;
+
+                if      (r > act_max) r = act_max;
+                else if (r < act_min) r = act_min;
+
+                out->data[(oh * out_w + ow) * n_filters + k] = (int8_t)r;
+            }
+        }
+    }
+
+    free(mult); free(shift); free(bias_q);
+    return out;
 }
